@@ -24,10 +24,9 @@ from PySide6.QtCore import (
     QTranslator,
     QUrl,
     Signal,
-    QLocale,
-    QCoreApplication,
 )
 from PySide6.QtGui import (
+    QAction,
     QCloseEvent,
     QCursor,
     QFont,
@@ -37,6 +36,7 @@ from PySide6.QtGui import (
     QKeyEvent,
     QMouseEvent,
     QPixmap,
+    QScreen,
     QSurfaceFormat,
     QWheelEvent,
 )
@@ -57,8 +57,10 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QLabel,
+    QMenu,
     QMessageBox,
     QStatusBar,
+    QSystemTrayIcon,
     QWidget,
 )
 from loguru import logger
@@ -97,100 +99,65 @@ from ui.ui_main import MainWindow
 from ui.ui_messagebox import MessageBox
 from ui.ui_paste_board import PasteBoardDialog
 from ui.ui_settings import SettingsDialog
+from video_frame_widget import VideoFrameWidget
 
 # 特定系统依赖
 if platform.system() == "Windows":
-    import pythoncom
-    import pyWinhook as pyHook
+    try:
+        import pythoncom
+    except Exception:
+        pythoncom = None
+    try:
+        import pyWinhook as pyHook
+    except Exception:
+        pyHook = None
+    try:
+        from video_dshow_capture import DshowRgb24CaptureWorker
+    except Exception:
+        DshowRgb24CaptureWorker = None
+else:
+    DshowRgb24CaptureWorker = None
 
 
-class ControllerEventExecutor(QObject):
-    device_execute_signal = Signal()
-    device_reply_signal = Signal(str, int, typing.Any)
+WM_WTSSESSION_CHANGE = 0x02B1
+WTS_SESSION_LOCK = 0x0007
 
-    def __init__(self, parent: QObject | None = None):
-        super().__init__(parent)
-        self.device_mutex = QMutex()
-        self.deque_mutex = QMutex()
-        self.controller_device = ControllerGeneralDevice()
-        self.deque: typing.Deque[typing.Tuple[str, typing.Any]] = (
-            collections.deque()
-        )
 
-        self.device_execute_signal.connect(
-            self.device_event_execute, type=Qt.ConnectionType.QueuedConnection
-        )
-        # reply 预留好了槽
-        # 但不需要使用所以暂时注释掉
-        # self.device_reply_signal.connect(self.device_reply, type=Qt.ConnectionType.QueuedConnection)
+class WindowsPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
-    def device_init(self, buffer: typing.Any) -> bool:
-        with QMutexLocker(self.device_mutex):
-            self.controller_device.device_init(buffer)
-        return True
 
-    def device_close(self) -> None:
-        with QMutexLocker(self.device_mutex):
-            self.controller_device.device_close()
-
-    def device_event_store(self, command: str, buffer: typing.Any) -> None:
-        with QMutexLocker(self.deque_mutex):
-            self.deque.append((command, buffer))
-
-    def device_event_execute(self):
-        with QMutexLocker(self.deque_mutex):
-            try:
-                command, buffer = self.deque.popleft()
-            except IndexError:
-                return
-            while len(self.deque) > 0:
-                # 如果下一条命令和上一条命令一样切都为 mouse_absolute_write 则可以安全的跳过指令
-                if command == "mouse_absolute_write":
-                    next_command, next_buffer = self.deque.popleft()
-                    if next_command == command:
-                        command = next_command
-                        buffer = next_buffer
-                        continue
-                    else:
-                        self.deque.appendleft((next_command, next_buffer))
-                break
-        with QMutexLocker(self.device_mutex):
-            status_code: int
-            reply: typing.Any
-            _, status_code, reply = self.controller_device.device_event(
-                command, buffer
-            )
-            self.device_reply_signal.emit(command, status_code, reply)
-        pass
-
-    def device_reply(self, command: str, status: int, data: typing.Any) -> None:
-        pass
+class WindowsMsg(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", ctypes.c_void_p),
+        ("message", ctypes.c_uint),
+        ("wParam", ctypes.c_void_p),
+        ("lParam", ctypes.c_void_p),
+        ("time", ctypes.c_uint32),
+        ("pt", WindowsPoint),
+    ]
 
 
 class ControllerEventProxy(QObject):
-    command_send_signal = Signal(str, typing.Any)
-    command_reply_signal = Signal(str, int, typing.Any)
+    command_send_signal = Signal(str, object)
+    command_reply_signal = Signal(str, int, object)
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
-        self.device_event_executor = ControllerEventExecutor()
-        self.execute_thread = QThread()
-
+        self.mutex = QMutex()
+        self.mutex_locker = QMutexLocker(self.mutex)
+        self.controller_device = ControllerGeneralDevice()
         self.command_send_signal.connect(self.command_send)
         self.command_reply_signal.connect(self.command_reply)
-        self.device_event_executor.device_reply_signal.connect(
-            self.command_reply_signal
-        )
-        self.device_event_executor.moveToThread(self.execute_thread)
-        self.execute_thread.start()
 
     def device_init(self, buffer: typing.Any) -> bool:
-        return self.device_event_executor.device_init(buffer)
+        with self.mutex_locker:
+            self.controller_device.device_init(buffer)
+        return True
 
-    def device_close(self) -> None:
-        self.device_event_executor.device_close()
-
-    def command_send(self, command: str, buffer: typing.Any) -> None:
+    def command_send(
+        self, command: str, buffer: object
+    ) -> tuple[str, int, object]:
         """
         command list:
         "device_open"
@@ -198,21 +165,21 @@ class ControllerEventProxy(QObject):
         "device_check"
         "device_reload"
         "device_reset"
-        "device_sleep"
         "keyboard_read"
         "keyboard_write"
         "mouse_relative_write"
         "mouse_absolute_write"
         """
-        # 把命令放入队列
-        self.device_event_executor.device_event_store(command, buffer)
+        status_code: int = 1
+        reply = None
+        with self.mutex_locker:
+            _, status_code, reply = self.controller_device.device_event(
+                command, buffer
+            )
+            self.command_reply_signal.emit(command, status_code, reply)
+        return command, status_code, reply
 
-        # 执行队列中的一个命令
-        self.device_event_executor.device_execute_signal.emit()
-
-    def command_reply(
-        self, command: str, status: int, data: typing.Any
-    ) -> None:
+    def command_reply(self, command: str, status: int, data: object):
         pass
 
 
@@ -316,7 +283,7 @@ class KeyboardCodeData:
         hid_code: int | None = self.key_name_to_hid_code.get(key_name, None)
         if hid_code is None:
             logger.warning(f"Unknown key name: {key_name}")
-            hid_code: int = 0
+            hid_code = 0
             return status, hid_code
         else:
             status = True
@@ -346,18 +313,32 @@ class VideoSession(QObject):
         return video_device
 
     # 根据配置设置相机格式
+    @staticmethod
+    def normalize_camera_pixel_format(pixel_format: str) -> str:
+        upper_value = pixel_format.upper()
+        if upper_value in {"YUY2", "YUYV", "YUYV422"}:
+            return "YUYV"
+        if upper_value in {"MJPG", "MJPEG", "JPEG", "JPG"}:
+            return "MJPEG"
+        if upper_value in {"RGB24", "NV12"}:
+            return upper_value
+        return pixel_format
+
     def set_camera_format_with_config(
         self, config: dict[str, typing.Any]
     ) -> bool:
         setting_done = False
+        target_format = self.normalize_camera_pixel_format(config["format"])
         for camera_format in self.device.videoFormats():
             resolution_x = camera_format.resolution().width()
             resolution_y = camera_format.resolution().height()
-            pixel_format = camera_format.pixelFormat().name.split("_")[1]
+            pixel_format = self.normalize_camera_pixel_format(
+                camera_format.pixelFormat().name.split("_")[1]
+            )
             if (
                 resolution_x == config["resolution_x"]
                 and resolution_y == config["resolution_y"]
-                and pixel_format == config["format"]
+                and pixel_format == target_format
             ):
                 self.camera.setCameraFormat(camera_format)
                 setting_done = True
@@ -384,7 +365,9 @@ class VideoSession(QObject):
             )
 
     def init_capture_session_with_config(
-        self, config: dict[str, typing.Any]
+        self,
+        config: dict[str, typing.Any],
+        video_output: QVideoWidget | None = None,
     ) -> None:
         # 设置视频捕捉
         self.capture_session = QMediaCaptureSession()
@@ -394,7 +377,10 @@ class VideoSession(QObject):
 
         # capture_session 设定
         self.capture_session.setCamera(self.camera)
-        self.capture_session.setVideoSink(self.video_sink)
+        if video_output is not None:
+            self.capture_session.setVideoOutput(video_output)
+        else:
+            self.capture_session.setVideoSink(self.video_sink)
         self.capture_session.setImageCapture(self.image_capture)
         self.capture_session.setRecorder(self.video_record)
 
@@ -557,16 +543,17 @@ class MainWindowStatusBarManager:
 class AppMainWindow(MainWindow):
     # 窗口标题
     WINDOW_TITLE: str = "USB KVM Client"
-    QT_BASE_TRANSLATOR: QTranslator = QTranslator()
-    WINDOW_TRANSLATOR: QTranslator = QTranslator()
 
     def __init__(self, parent: QWidget | None = None):
         # 初始化父类
         super().__init__(parent)
 
+        if platform.system() == "Windows":
+            self.setWindowFlag(Qt.Tool, True)
+
         # 初始化状态
-        # self.status: StatusBuffer = StatusBuffer()
-        self.status: StatusBuffer = StatusBuffer(
+        self.status = StatusBuffer()
+        self.status = StatusBuffer(
             {
                 "screen_height": 0,
                 "screen_width": 0,
@@ -581,6 +568,7 @@ class AppMainWindow(MainWindow):
                 "disable_hotkey": False,
                 "quick_paste": True,
                 "hook_state": False,
+                "sync_lock_screen": False,
                 # 鼠标使用的状态标志
                 "pause_mouse": False,
                 "mouse_capture": False,
@@ -593,7 +581,7 @@ class AppMainWindow(MainWindow):
         )
 
         # self.mutex = QMutex()
-        self.child_dialog: list[typing.Any] = []
+        # self.mutex_locker = QMutexLocker(self.mutex)
         self.threads = QtThreadManager()
         self.timer = QtTimerManager()
         self.source_directory: str = project_source_directory_path()
@@ -622,19 +610,6 @@ class AppMainWindow(MainWindow):
         self.paste_board_dialog = PasteBoardDialog()
         self.settings_dialog = SettingsDialog()
 
-        self.child_dialog.extend(
-            [
-                self.about_dialog,
-                self.custom_key_dialog,
-                self.indicator_lights_dialog,
-                self.paste_board_dialog,
-                self.settings_dialog,
-            ]
-        )
-
-        # 刷新 ui 语言翻译
-        self.refresh_translate()
-
         # 加载图标
         # 加载窗口图标
         self.init_window_icon()
@@ -643,22 +618,44 @@ class AppMainWindow(MainWindow):
         # 初始化子窗口图标
         self.init_sub_window_icon()
 
+        self.tray_icon: QSystemTrayIcon | None = None
+        self.tray_menu: QMenu | None = None
+        self.tray_menu_shortcut_keys: QMenu | None = None
+        self.tray_menu_fullscreen_to: QMenu | None = None
+        self.tray_action_show: QAction | None = None
+        self.tray_action_connect: QAction | None = None
+        self.tray_action_disconnect: QAction | None = None
+        self.tray_action_topmost: QAction | None = None
+        self.tray_action_sync_lock_screen: QAction | None = None
+        self.tray_action_quit: QAction | None = None
+        self._is_quitting: bool = False
+        self._tray_notice_shown: bool = False
+        self._session_notification_registered: bool = False
+        self.init_tray_icon()
+
         # 初始化快捷键菜单
         self.init_shortcut_keys_menu()
 
         # 菜单初始状态设定
         self.init_menu_checked_state()
+        self.action_capture_image.setEnabled(False)
+        self.action_record_video.setEnabled(False)
 
         # 初始化状态栏
         self.status_bar_manager = MainWindowStatusBarManager(self.statusbar)
 
         # 初始化 video widget
-        self.video_widget: QVideoWidget | None = None
+        self.video_frame_widget: VideoFrameWidget | None = None
+        self.video_qt_widget: QVideoWidget | None = None
+        self.video_widget: QWidget | None = None
         self.video_disconnect_label = QLabel()
+        self.video_session: VideoSession | None = None
         self.init_video_widget()
+        self.apply_video_display_config()
 
-        # 初始化 video session 相关变量
-        self.video_session: VideoSession = VideoSession()
+        self.video_capture_thread: QThread | None = None
+        self.video_capture_worker: typing.Any = None
+        self.video_fps: float = 0.0
 
         # 初始化键盘以及鼠标数据的缓冲buffer
         self.keyboard_key_buffer: KeyboardKeyBuffer | None = None
@@ -748,6 +745,308 @@ class AppMainWindow(MainWindow):
         main_icon: QIcon = self.load_icon("main.ico")
         self.setWindowIcon(main_icon)
 
+    def init_tray_icon(self) -> None:
+        if platform.system() != "Windows":
+            return
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        if self.tray_icon is not None:
+            return
+        self.tray_menu = QMenu(self)
+        self.tray_menu.aboutToShow.connect(self.refresh_tray_menu)
+        self.tray_menu_shortcut_keys = QMenu(
+            self.menu_shortcut_keys.title(), self.tray_menu
+        )
+        self.tray_menu_shortcut_keys.setIcon(self.menu_shortcut_keys.icon())
+        self.tray_menu_fullscreen_to = QMenu("全屏到", self.tray_menu)
+        self.tray_menu_fullscreen_to.setIcon(self.action_fullscreen.icon())
+        self.tray_action_show = QAction("显示", self)
+        self.tray_action_connect = QAction(
+            self.action_device_connect.text(), self
+        )
+        self.tray_action_disconnect = QAction(
+            self.action_device_disconnect.text(), self
+        )
+        self.tray_action_topmost = QAction(self.action_topmost.text(), self)
+        self.tray_action_topmost.setCheckable(True)
+        self.tray_action_sync_lock_screen = QAction("同步锁屏", self)
+        self.tray_action_sync_lock_screen.setCheckable(True)
+        self.tray_action_sync_lock_screen.setEnabled(
+            self.status.is_enabled("controller")
+        )
+        self.tray_action_quit = QAction("退出", self)
+        self.tray_action_show.triggered.connect(self.show_from_tray)
+        self.tray_action_connect.triggered.connect(self.connect_devices)
+        self.tray_action_disconnect.triggered.connect(self.disconnect_devices)
+        self.tray_action_topmost.triggered.connect(self.tray_topmost_triggered)
+        self.tray_action_sync_lock_screen.triggered.connect(
+            self.tray_sync_lock_screen_triggered
+        )
+        self.tray_action_quit.triggered.connect(self.request_quit)
+        self.tray_action_connect.setIcon(self.action_device_connect.icon())
+        self.tray_action_disconnect.setIcon(
+            self.action_device_disconnect.icon()
+        )
+        self.tray_action_topmost.setIcon(self.action_topmost.icon())
+        self.tray_menu.addAction(self.tray_action_show)
+        self.tray_menu.addSeparator()
+        self.tray_menu.addAction(self.tray_action_connect)
+        self.tray_menu.addAction(self.tray_action_disconnect)
+        self.tray_menu.addAction(self.tray_action_topmost)
+        self.tray_menu.addAction(self.tray_action_sync_lock_screen)
+        self.tray_menu.addSeparator()
+        self.tray_menu.addMenu(self.tray_menu_fullscreen_to)
+        self.tray_menu.addMenu(self.tray_menu_shortcut_keys)
+        self.tray_menu.addSeparator()
+        self.tray_menu.addAction(self.tray_action_quit)
+        self.tray_icon = QSystemTrayIcon(self.windowIcon(), self)
+        self.tray_icon.setToolTip(self.WINDOW_TITLE)
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self.tray_icon_activated)
+        self.tray_icon.show()
+
+    def tray_icon_activated(
+        self, reason: QSystemTrayIcon.ActivationReason
+    ) -> None:
+        if reason in [
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ]:
+            if self.isVisible():
+                self.hide_to_tray()
+            else:
+                self.show_from_tray()
+
+    def hide_to_tray(self) -> None:
+        self.hide()
+        if self.tray_icon is None:
+            return
+        if self._tray_notice_shown:
+            return
+        self.tray_icon.showMessage(
+            self.WINDOW_TITLE,
+            "程序已在托盘运行",
+            QSystemTrayIcon.MessageIcon.Information,
+            2000,
+        )
+        self._tray_notice_shown = True
+
+    def show_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def tray_sync_lock_screen_triggered(self) -> None:
+        if self.tray_action_sync_lock_screen is None:
+            return
+        self.status.set_bool(
+            "sync_lock_screen", self.tray_action_sync_lock_screen.isChecked()
+        )
+
+    def register_windows_session_notification(self) -> None:
+        if platform.system() != "Windows":
+            return
+        if self._session_notification_registered:
+            return
+        from ctypes import wintypes
+
+        hwnd = wintypes.HWND(int(self.winId()))
+        if hwnd.value == 0:
+            return
+        wts = ctypes.windll.wtsapi32
+        ok = wts.WTSRegisterSessionNotification(hwnd, 0)
+        if ok:
+            self._session_notification_registered = True
+
+    def unregister_windows_session_notification(self) -> None:
+        if platform.system() != "Windows":
+            return
+        if not self._session_notification_registered:
+            return
+        from ctypes import wintypes
+
+        hwnd = wintypes.HWND(int(self.winId()))
+        if hwnd.value == 0:
+            return
+        wts = ctypes.windll.wtsapi32
+        wts.WTSUnRegisterSessionNotification(hwnd)
+        self._session_notification_registered = False
+
+    def on_windows_session_change(self, wparam: int, lparam: int) -> None:
+        if wparam == 0x0007:
+            self.handle_windows_session_lock()
+
+    def handle_windows_session_lock(self) -> None:
+        if not self.status.is_enabled("controller"):
+            return
+        if not self.status.is_enabled("sync_lock_screen"):
+            return
+        self.shortcut_key_send(["win_left", "l"])
+
+    def refresh_tray_menu(self) -> None:
+        if self.tray_action_topmost is not None:
+            self.tray_action_topmost.setChecked(
+                self.status.is_enabled("topmost_window")
+            )
+        if self.tray_action_sync_lock_screen is not None:
+            self.tray_action_sync_lock_screen.setChecked(
+                self.status.is_enabled("sync_lock_screen")
+            )
+        if self.tray_menu_fullscreen_to is None:
+            return
+        self.tray_menu_fullscreen_to.clear()
+        primary_screen = QGuiApplication.primaryScreen()
+        windows_displays = self.get_windows_active_displays()
+        for i, screen in enumerate(QGuiApplication.screens()):
+            win_name = None
+            g = screen.geometry()
+            for d in windows_displays:
+                if (
+                    abs(d["x"] - g.x()) <= 10
+                    and abs(d["y"] - g.y()) <= 10
+                    and abs(d["w"] - g.width()) <= 10
+                    and abs(d["h"] - g.height()) <= 10
+                ):
+                    win_name = d["name"]
+                    break
+            prefix = f"显示器 {i + 1}"
+            if screen == primary_screen:
+                prefix += "（主）"
+            name_parts = [prefix, screen.name()]
+            if win_name:
+                name_parts.append(f"({win_name})")
+            action = self.tray_menu_fullscreen_to.addAction(
+                " ".join(name_parts)
+            )
+            action.triggered.connect(
+                lambda _checked, s=screen: self.tray_fullscreen_to_screen(s)
+            )
+
+    @staticmethod
+    def get_windows_active_displays() -> list[dict[str, int | str]]:
+        if platform.system() != "Windows":
+            return []
+        from ctypes import wintypes
+
+        class DISPLAY_DEVICEW(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("DeviceName", wintypes.WCHAR * 32),
+                ("DeviceString", wintypes.WCHAR * 128),
+                ("StateFlags", wintypes.DWORD),
+                ("DeviceID", wintypes.WCHAR * 128),
+                ("DeviceKey", wintypes.WCHAR * 128),
+            ]
+
+        class POINTL(ctypes.Structure):
+            _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+        class DEVMODEW(ctypes.Structure):
+            _fields_ = [
+                ("dmDeviceName", wintypes.WCHAR * 32),
+                ("dmSpecVersion", wintypes.WORD),
+                ("dmDriverVersion", wintypes.WORD),
+                ("dmSize", wintypes.WORD),
+                ("dmDriverExtra", wintypes.WORD),
+                ("dmFields", wintypes.DWORD),
+                ("dmPosition", POINTL),
+                ("dmDisplayOrientation", wintypes.DWORD),
+                ("dmDisplayFixedOutput", wintypes.DWORD),
+                ("dmColor", wintypes.SHORT),
+                ("dmDuplex", wintypes.SHORT),
+                ("dmYResolution", wintypes.SHORT),
+                ("dmTTOption", wintypes.SHORT),
+                ("dmCollate", wintypes.SHORT),
+                ("dmFormName", wintypes.WCHAR * 32),
+                ("dmLogPixels", wintypes.WORD),
+                ("dmBitsPerPel", wintypes.DWORD),
+                ("dmPelsWidth", wintypes.DWORD),
+                ("dmPelsHeight", wintypes.DWORD),
+                ("dmDisplayFlags", wintypes.DWORD),
+                ("dmDisplayFrequency", wintypes.DWORD),
+                ("dmICMMethod", wintypes.DWORD),
+                ("dmICMIntent", wintypes.DWORD),
+                ("dmMediaType", wintypes.DWORD),
+                ("dmDitherType", wintypes.DWORD),
+                ("dmReserved1", wintypes.DWORD),
+                ("dmReserved2", wintypes.DWORD),
+                ("dmPanningWidth", wintypes.DWORD),
+                ("dmPanningHeight", wintypes.DWORD),
+            ]
+
+        enum_display_devices = ctypes.windll.user32.EnumDisplayDevicesW
+        enum_display_devices.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            ctypes.POINTER(DISPLAY_DEVICEW),
+            wintypes.DWORD,
+        ]
+        enum_display_devices.restype = wintypes.BOOL
+
+        enum_display_settings = ctypes.windll.user32.EnumDisplaySettingsExW
+        enum_display_settings.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            ctypes.POINTER(DEVMODEW),
+            wintypes.DWORD,
+        ]
+        enum_display_settings.restype = wintypes.BOOL
+
+        attached_to_desktop = 0x00000001
+        current_settings = wintypes.DWORD(-1).value
+
+        displays: list[dict[str, int | str]] = []
+        for i in range(64):
+            dd = DISPLAY_DEVICEW()
+            dd.cb = ctypes.sizeof(dd)
+            if not enum_display_devices(None, i, ctypes.byref(dd), 0):
+                break
+            if not (dd.StateFlags & attached_to_desktop):
+                continue
+            dm = DEVMODEW()
+            dm.dmSize = ctypes.sizeof(dm)
+            if not enum_display_settings(
+                dd.DeviceName, current_settings, ctypes.byref(dm), 0
+            ):
+                continue
+            displays.append(
+                {
+                    "name": dd.DeviceName,
+                    "x": int(dm.dmPosition.x),
+                    "y": int(dm.dmPosition.y),
+                    "w": int(dm.dmPelsWidth),
+                    "h": int(dm.dmPelsHeight),
+                }
+            )
+        return displays
+
+    def tray_fullscreen_to_screen(self, screen: QScreen) -> None:
+        if self.status.is_enabled("fullscreen"):
+            self.fullscreen_state_toggle()
+        self.show_from_tray()
+        handle = self.windowHandle()
+        if handle is not None:
+            handle.setScreen(screen)
+        g = screen.geometry()
+        self.move(g.x() + 10, g.y() + 10)
+        self.window_topmost_set(True)
+        if not self.status.is_enabled("fullscreen"):
+            self.fullscreen_state_toggle()
+
+    def tray_topmost_triggered(self) -> None:
+        if self.tray_action_topmost is None:
+            return
+        self.window_topmost_set(self.tray_action_topmost.isChecked())
+
+    def request_quit(self) -> None:
+        if self._is_quitting:
+            return
+        self._is_quitting = True
+        self.close()
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
     # 初始化菜单栏图标
     def init_menu_icon(self) -> None:
         # menu_device_menu
@@ -757,10 +1056,6 @@ class AppMainWindow(MainWindow):
         self.action_device_reset.setIcon(self.load_icon("reset.png"))
         self.action_settings.setIcon(self.load_icon("setting.png"))
         self.action_minimize.setIcon(self.load_icon("window-minimize.png"))
-        self.action_maximize.setIcon(self.load_icon("window-maximize.png"))
-        self.action_normal_size.setIcon(
-            self.load_icon("window-normal-size.png")
-        )
         self.action_exit.setIcon(self.load_icon("window-close.png"))
 
         # menu_video
@@ -828,15 +1123,19 @@ class AppMainWindow(MainWindow):
 
     # 初始化快捷键菜单
     def init_shortcut_keys_menu(self) -> None:
-        self.menu_shortcut_keys.clear()
-        for action_name in self.config.shortcut_keys.keys():
-            action = self.menu_shortcut_keys.addAction(action_name)
-            action.triggered.connect(
-                lambda _checked, triggered_keys=action_name: self.shortcut_key_triggered(
-                    triggered_keys
+        def fill_menu(menu: QMenu) -> None:
+            menu.clear()
+            for action_name in self.config.shortcut_keys.keys():
+                action = menu.addAction(action_name)
+                action.triggered.connect(
+                    lambda _checked, triggered_keys=action_name: self.shortcut_key_triggered(
+                        triggered_keys
+                    )
                 )
-            )
-        pass
+
+        fill_menu(self.menu_shortcut_keys)
+        if self.tray_menu_shortcut_keys is not None:
+            fill_menu(self.tray_menu_shortcut_keys)
 
     # 初始化菜单点击状态
     def init_menu_checked_state(self):
@@ -850,9 +1149,10 @@ class AppMainWindow(MainWindow):
 
     # 初始化系统hook
     def init_system_hook(self):
-        if platform.system() == "Windows":
-            pass
-        else:
+        if platform.system() != "Windows":
+            return
+        if pyHook is None or pythoncom is None:
+            self.action_system_hook.setEnabled(False)
             return
         self.hook_manager = pyHook.HookManager()
         self.hook_manager.KeyDown = self.hook_keyboard_down_event
@@ -869,10 +1169,8 @@ class AppMainWindow(MainWindow):
         self.action_device_reload.triggered.connect(self.reload_devices)
         self.action_device_reset.triggered.connect(self.reset_devices)
         self.action_settings.triggered.connect(self.execute_settings_dialog)
-        self.action_minimize.triggered.connect(self.showMinimized)
-        self.action_maximize.triggered.connect(self.showMaximized)
-        self.action_normal_size.triggered.connect(self.showNormal)
-        self.action_exit.triggered.connect(self.close)
+        self.action_minimize.triggered.connect(self.hide_to_tray)
+        self.action_exit.triggered.connect(self.request_quit)
 
         # video 菜单
         self.action_fullscreen.triggered.connect(self.fullscreen_state_toggle)
@@ -973,7 +1271,7 @@ class AppMainWindow(MainWindow):
 
         # keyboard 菜单需要的信号连接
         self.indicator_lights_dialog.lock_key_clicked_signal.connect(
-            self.keyboard_simulation_click_with_keyname
+            self.update_keyboard_indicator_buffer_with_hid_code
         )
 
         # controller event
@@ -1017,64 +1315,16 @@ class AppMainWindow(MainWindow):
         else:
             return self.tr("Disable")
 
-    def select_language_name(self) -> str:
-        config_language: str = self.config.ui["language"].lower()
-        # 获取系统当前区域设置
-        sys_locale = QLocale.system()
-        # 获取完整的语言环境名称
-        # 如 zh_cn en_us
-        sys_locale_name = sys_locale.name().lower()
-        if config_language == "auto":
-            ui_locale_name = sys_locale_name
-        elif config_language.startswith("english"):
-            ui_locale_name = "en_us"
-        elif config_language.startswith("simplified chinese"):
-            ui_locale_name = "zh_cn"
-        elif config_language.startswith("traditional chinese"):
-            ui_locale_name = "zh_tw"
-        else:
-            ui_locale_name = "en_us"
-        return ui_locale_name
+    # 固定延迟
+    @staticmethod
+    def sleep_ms(interval: int = 1):
+        QThread.msleep(interval)
 
-    def refresh_translate(self):
-        qt_base_translator = self.QT_BASE_TRANSLATOR
-        window_translator = self.WINDOW_TRANSLATOR
-
-        selected_language: str = self.select_language_name()
-        translation_directory_path = project_source_directory_path(
-            "translations"
-        )
-        translation_files_path: list[typing.Tuple[str, QTranslator]] = [
-            (
-                os.path.join(
-                    translation_directory_path, f"qtbase_{selected_language}.qm"
-                ),
-                qt_base_translator,
-            ),
-            (
-                os.path.join(
-                    translation_directory_path, f"main_{selected_language}.qm"
-                ),
-                window_translator,
-            ),
-        ]
-
-        # 清空翻译
-        qt_base_translator.load("")
-        window_translator.load("")
-
-        # 载入翻译
-        for file_path, translator in translation_files_path:
-            if os.path.isfile(file_path):
-                translator.load(file_path)
-
-        # 更新UI
-        self.retranslateUi(self)
-        for child in self.child_dialog:
-            if hasattr(child, "retranslateUi"):
-                child.retranslateUi(child)
-            else:
-                logger.error("Unknown object type.")
+    # 随机延迟
+    @staticmethod
+    def random_sleep_ms(min_interval: int = 0, max_interval: int = 100):
+        random_time = int(random.uniform(min_interval, max_interval))
+        QThread.msleep(random_time)
 
     ######################################################################
     # 主窗口相关函数
@@ -1158,40 +1408,47 @@ class AppMainWindow(MainWindow):
             pass
         event_timer.stop()
 
-    # 切换保持窗口在最前
-    def window_topmost_state_toggle(self):
-        self.status.reverse_bool("topmost_window")
+    def window_topmost_set(self, enable: bool) -> None:
+        self.status.set_bool("topmost_window", enable)
         current_window_flag = self.windowFlags()
-        if self.status.is_enabled("topmost_window"):
-            self.windowHandle().setFlags(
+        if enable:
+            new_window_flags = (
                 current_window_flag
                 | Qt.WindowType.WindowStaysOnTopHint
                 | Qt.WindowType.WindowCloseButtonHint
             )
         else:
-            self.windowHandle().setFlags(
+            new_window_flags = (
                 current_window_flag & ~Qt.WindowType.WindowStaysOnTopHint
                 | Qt.WindowType.WindowCloseButtonHint
             )
+        handle = self.windowHandle()
+        if handle is not None:
+            handle.setFlags(new_window_flags)
+        else:
+            self.setWindowFlags(new_window_flags)
+            if self.isVisible():
+                self.show()
         self.status_bar_manager.show_message(
             self.tr("Window topmost: ")
             + self.to_enabled_string(self.status.is_enabled("topmost_window"))
         )
         self.action_topmost.setChecked(self.status.is_enabled("topmost_window"))
+        if self.tray_action_topmost is not None:
+            self.tray_action_topmost.setChecked(
+                self.status.is_enabled("topmost_window")
+            )
+
+    def window_topmost_state_toggle(self) -> None:
+        self.window_topmost_set(not self.status.is_enabled("topmost_window"))
 
     # 保持比例拉伸
     def keep_aspect_ratio_toggle(self):
         self.status.reverse_bool("keep_aspect_ratio")
-        if self.status.is_enabled("keep_aspect_ratio"):
-            self.video_widget.setAspectRatioMode(
-                Qt.AspectRatioMode.KeepAspectRatio
-            )
-            self.action_keep_aspect_ratio.setChecked(True)
-        else:
-            self.video_widget.setAspectRatioMode(
-                Qt.AspectRatioMode.IgnoreAspectRatio
-            )
-            self.action_keep_aspect_ratio.setChecked(False)
+        self.apply_video_display_config()
+        self.action_keep_aspect_ratio.setChecked(
+            self.status.is_enabled("keep_aspect_ratio")
+        )
         self.status_bar_manager.show_message(
             self.tr("Keep aspect ratio: ")
             + self.to_enabled_string(self.status["keep_aspect_ratio"])
@@ -1288,7 +1545,7 @@ class AppMainWindow(MainWindow):
                 key_code, KeyStateEnum.PRESS
             )
             self.send_keyboard_buffer()
-        self.controller_sleep_ms(1)
+        self.random_sleep_ms()
         for key_code in key_code_list:
             self.update_keyboard_buffer_with_hid_code(
                 key_code, KeyStateEnum.RELEASE
@@ -1338,33 +1595,26 @@ class AppMainWindow(MainWindow):
 
     # 键盘模拟按下
     def keyboard_simulation_press(self, hid_code: int):
+        # 指示器按键则更新指示器buffer
+        self.update_keyboard_indicator_buffer_with_hid_code(hid_code)
         # 更新键盘buffer
         self.update_keyboard_buffer_with_hid_code(hid_code, KeyStateEnum.PRESS)
         self.send_keyboard_buffer()
 
     # 键盘模拟松开
     def keyboard_simulation_release(self, hid_code: int):
+        # 指示器按键则更新指示器buffer
+        self.update_keyboard_indicator_buffer_with_hid_code(hid_code)
         # 更新键盘buffer
-        self.update_keyboard_buffer_with_hid_code(
-            hid_code, KeyStateEnum.RELEASE
-        )
+        self.update_keyboard_buffer_with_hid_code(hid_code, KeyStateEnum.PRESS)
         self.send_keyboard_buffer()
 
     # 键盘模拟单击按键
     def keyboard_simulation_click(self, hid_code: int):
-        # 指示器按键则更新指示器buffer
-        self.update_keyboard_indicator_buffer_with_hid_code(hid_code)
         self.keyboard_simulation_press(hid_code)
+        # 固定等待1ms
+        self.sleep_ms(1)
         self.keyboard_simulation_release(hid_code)
-
-    # 键盘模拟单击按键
-    def keyboard_simulation_click_with_keyname(self, data: str):
-        result, hid_code = self.keyboard_code_data.convert_key_name_to_hid_code(
-            data
-        )
-        if not result:
-            return
-        self.keyboard_simulation_click(hid_code)
 
     # 使用键盘发送字符串
     def keyboard_send_string(self, data: str):
@@ -1411,12 +1661,7 @@ class AppMainWindow(MainWindow):
             else:
                 self.keyboard_simulation_press(key_code)
                 self.keyboard_simulation_release(key_code)
-            self.controller_sleep_ms(self.config.paste_board["interval"])
-
-        # 再次强制清空缓冲区
-        self.clear_keyboard_buffer()
-        self.send_keyboard_buffer()
-
+            self.sleep_ms(self.config.paste_board["interval"])
         self.user_input_block(False)
 
     # 快速粘贴功能开关切换
@@ -1478,6 +1723,17 @@ class AppMainWindow(MainWindow):
                 QMessageBox.StandardButton.NoButton,
             )
             return
+        if pyHook is None or pythoncom is None or self.hook_manager is None:
+            QMessageBox.critical(
+                self,
+                self.tr("Error"),
+                self.tr(
+                    "pyWinhook is not installed, system hook is unavailable."
+                ),
+                QMessageBox.StandardButton.Ok,
+                QMessageBox.StandardButton.NoButton,
+            )
+            return
         pythoncom_timer = self.timer.get("PYTHONCOM_TIMER")
         self.status.reverse_bool("hook_state")
         hook_state = self.status.get_bool("hook_state")
@@ -1502,7 +1758,6 @@ class AppMainWindow(MainWindow):
     # 释放鼠标功能
     def mouse_capture_release_triggered(self) -> None:
         self.status.set_bool("mouse_capture", False)
-        self.status_bar_manager.show_message(self.tr("Mouse released"))
 
     # 相对模式菜单触发
     def mouse_relative_mode_triggered(self):
@@ -1651,19 +1906,7 @@ class AppMainWindow(MainWindow):
     # 检查控制器连接
     def check_controller_connection(self):
         if self.status.is_enabled("controller"):
-            self.controller_command_send("device_check_connection", None)
-
-    # 控制器发送睡眠时间信号
-    # interval 为睡眠毫秒数
-    def controller_sleep_ms(self, interval: int = 1):
-        self.controller_command_send("device_sleep", interval)
-
-    # 控制器发送随机睡眠时间信号
-    def controller_random_sleep_ms(
-        self, min_interval: int = 0, max_interval: int = 100
-    ):
-        random_time = int(random.uniform(min_interval, max_interval))
-        self.controller_sleep_ms(random_time)
+            self.controller_command_send("check_connection", None)
 
     # 控制器发送命令信号
     def controller_command_send(self, command: str, data: typing.Any):
@@ -1676,7 +1919,6 @@ class AppMainWindow(MainWindow):
         ignored_command = [
             "device_reload",
             "device_reset",
-            "device_sleep",
             "mouse_relative_write",
             "mouse_absolute_write",
             "keyboard_write",
@@ -1685,17 +1927,29 @@ class AppMainWindow(MainWindow):
             if status == 0:
                 # open 成功
                 self.status.set_bool("controller", True)
+                self.status.set_bool("sync_lock_screen", True)
+                if self.tray_action_sync_lock_screen is not None:
+                    self.tray_action_sync_lock_screen.setEnabled(True)
+                    self.tray_action_sync_lock_screen.setChecked(True)
                 self.status_bar_manager.show_message(
                     self.tr("Controller connected")
                 )
             else:
                 self.status.set_bool("controller", False)
+                self.status.set_bool("sync_lock_screen", False)
+                if self.tray_action_sync_lock_screen is not None:
+                    self.tray_action_sync_lock_screen.setEnabled(False)
+                    self.tray_action_sync_lock_screen.setChecked(False)
                 self.status_bar_manager.show_message(
                     self.tr("Controller connect failure")
                 )
         elif command == "device_close":
             self.status.set_bool("controller", False)
-        elif command == "device_check_connection":
+            self.status.set_bool("sync_lock_screen", False)
+            if self.tray_action_sync_lock_screen is not None:
+                self.tray_action_sync_lock_screen.setEnabled(False)
+                self.tray_action_sync_lock_screen.setChecked(False)
+        elif command == "check_connection":
             if status != 0:
                 # 检查连接返回失败
                 self.disconnect_controller()
@@ -1751,10 +2005,6 @@ class AppMainWindow(MainWindow):
         self.status_bar_manager.update_label_status(
             self.keyboard_key_buffer, self.keyboard_indicator_buffer
         )
-        # 从缓冲区中清理已松开的按键
-        self.keyboard_key_buffer.clear_released()
-        # 控制器固定等待至少 1ms 确保系统能正确的响应按键信号
-        self.controller_sleep_ms(1)
 
     # 清空键盘按键缓冲区
     def clear_keyboard_buffer(self):
@@ -1826,8 +2076,8 @@ class AppMainWindow(MainWindow):
     def update_mouse_position_buffer_with_absolute_mode(self, x: int, y: int):
         self.mouse_last_pos = None
         if not self.status.is_enabled("camera"):
-            x_res = self.video_disconnect_label.width()
-            y_res = self.video_disconnect_label.height()
+            x_res = self.config.video["resolution_x"]
+            y_res = self.config.video["resolution_y"]
             width = self.video_disconnect_label.width()
             height = self.video_disconnect_label.height()
             x_pos = self.video_disconnect_label.pos().x()
@@ -1958,16 +2208,22 @@ class AppMainWindow(MainWindow):
 
     # 初始化 video widget
     def init_video_widget(self) -> None:
-        self.video_widget = QVideoWidget()
-        self.video_widget.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        self.video_frame_widget = VideoFrameWidget()
+        self.video_qt_widget = QVideoWidget()
+        self.video_widget = self.video_frame_widget
         self.takeCentralWidget()
-        self.setCentralWidget(self.video_widget)
-        self.video_widget.setMouseTracking(True)
-        # self.video_widget.children()[0].setMouseTracking(True)
-        for children in self.video_widget.children():
+        self.setCentralWidget(self.video_frame_widget)
+        self.video_frame_widget.setMouseTracking(True)
+        for children in self.video_frame_widget.children():
             if isinstance(children, QWidget):
                 children.setMouseTracking(True)
-        self.video_widget.hide()
+        self.video_frame_widget.hide()
+
+        self.video_qt_widget.setMouseTracking(True)
+        for children in self.video_qt_widget.children():
+            if isinstance(children, QWidget):
+                children.setMouseTracking(True)
+        self.video_qt_widget.hide()
 
         s_format = QSurfaceFormat.defaultFormat()
         s_format.setSwapInterval(0)
@@ -1990,15 +2246,64 @@ class AppMainWindow(MainWindow):
         self.setCentralWidget(self.video_disconnect_label)
         self.video_disconnect_label.show()
 
+    @staticmethod
+    def normalize_video_format_name(value: str) -> str:
+        upper_value = value.upper()
+        if upper_value in {"YUY2", "YUYV", "YUYV422"}:
+            return "YUYV"
+        if upper_value in {"MJPG", "MJPEG", "JPEG", "JPG"}:
+            return "MJPEG"
+        if upper_value in {"RGB24", "NV12"}:
+            return upper_value
+        return value
+
+    @staticmethod
+    def is_null_video_device(value: str) -> bool:
+        return value.strip().upper() == "NULL"
+
+    def apply_video_display_config(self) -> None:
+        keep_aspect_ratio = bool(self.status.get_bool("keep_aspect_ratio"))
+        if self.video_frame_widget is not None:
+            self.video_frame_widget.set_keep_aspect_ratio(keep_aspect_ratio)
+            self.video_frame_widget.set_flip_vertical(
+                bool(
+                    self.config.video.get(
+                        "flip_vertical",
+                        self.normalize_video_format_name(
+                            self.config.video.get("format", "")
+                        )
+                        == "RGB24",
+                    )
+                )
+            )
+        if self.video_qt_widget is not None:
+            self.video_qt_widget.setAspectRatioMode(
+                Qt.AspectRatioMode.KeepAspectRatio
+                if keep_aspect_ratio
+                else Qt.AspectRatioMode.IgnoreAspectRatio
+            )
+
+    def set_active_video_widget(self, widget: QWidget | None) -> None:
+        self.video_widget = widget
+        if self.video_frame_widget is not None:
+            self.video_frame_widget.hide()
+        if self.video_qt_widget is not None:
+            self.video_qt_widget.hide()
+
     # 设置 video_widget 是否启用
     def set_video_widget_enable(self, enable: bool):
         if enable:
             self.video_disconnect_label.hide()
+            if self.video_widget is None:
+                return
             self.video_widget.show()
             self.takeCentralWidget()
             self.setCentralWidget(self.video_widget)
         else:
-            self.video_widget.hide()
+            if self.video_frame_widget is not None:
+                self.video_frame_widget.hide()
+            if self.video_qt_widget is not None:
+                self.video_qt_widget.hide()
             self.video_disconnect_label.show()
             self.takeCentralWidget()
             self.setCentralWidget(self.video_disconnect_label)
@@ -2092,15 +2397,7 @@ class AppMainWindow(MainWindow):
         # 如果自动最大化选项打开则自动最大化窗口
         if self.config.ui["window_auto_maximized"]:
             self.showMaximized()
-        # 保持视频比例
-        if self.config.video["keep_aspect_ratio"]:
-            self.video_widget.setAspectRatioMode(
-                Qt.AspectRatioMode.KeepAspectRatio
-            )
-        else:
-            self.video_widget.setAspectRatioMode(
-                Qt.AspectRatioMode.IgnoreAspectRatio
-            )
+        self.apply_video_display_config()
 
     ######################################################################
     # 视频设备相关函数
@@ -2110,11 +2407,7 @@ class AppMainWindow(MainWindow):
     def video_device_error_occurred(
         self, error: QCamera.Error, message: str
     ) -> None:
-        error_s = (
-            f"Device: {self.video_session.device.description()}\n"
-            f"Error code: {error}\n"
-            f"Message: {message}\n"
-        )
+        error_s = f"Error code: {error}\n" f"Message: {message}\n"
         self.disconnect_video_device()
         QMessageBox.critical(
             self,
@@ -2127,66 +2420,194 @@ class AppMainWindow(MainWindow):
     # 视频设备初始化
     # noinspection PyUnresolvedReferences
     def init_video_device(self) -> bool:
-        status: bool = False
-        try:
-            # 使用配置初始化设备
-            self.video_session.init_video_device_with_config(self.config.video)
-            self.video_session.init_capture_session_with_config(
-                self.config.video_record
-            )
+        device_name = str(self.config.video.get("device", ""))
+        if self.is_null_video_device(device_name):
+            if (
+                self.video_capture_thread is not None
+                or self.video_session is not None
+            ):
+                self.disconnect_video_device()
+            self.video_capture_worker = None
+            self.video_capture_thread = None
+            self.video_fps = 0.0
+            self.status.set_bool("camera", False)
+            self.set_video_widget_enable(False)
+            self.setWindowTitle(self.WINDOW_TITLE)
+            return True
 
-            camera = self.video_session.camera
-            video_sink = self.video_session.video_sink
-            # 注册信号
-            video_sink.videoFrameChanged.connect(
-                self.video_widget_frame_changed
-            )
-            camera.errorOccurred.connect(self.video_device_error_occurred)
-            camera.start()
+        video_format = self.normalize_video_format_name(
+            str(self.config.video.get("format", "RGB24"))
+        )
+        if video_format == "RGB24":
+            return self.init_rgb24_video_device()
+        return self.init_qt_multimedia_video_device()
 
-            if not camera.isActive():
-                self.status.set_bool("camera", False)
-                raise RuntimeError(self.tr("Video device start failed"))
-            else:
-                self.status.set_bool("camera", True)
-            self.status.set_bool("video_recording", False)
-            status = True
-        except RuntimeError as error:
-            error_message = str(error)
+    def init_rgb24_video_device(self) -> bool:
+        if DshowRgb24CaptureWorker is None:
             QMessageBox.critical(
                 self,
                 self.tr("Video initialization error"),
-                error_message,
+                self.tr("DirectShow capture is unavailable."),
                 QMessageBox.StandardButton.Ok,
                 QMessageBox.StandardButton.NoButton,
             )
-        return status
+            return False
+
+        device_name = self.config.video["device"]
+        if self.is_null_video_device(device_name):
+            return True
+        if device_name == "":
+            QMessageBox.critical(
+                self,
+                self.tr("Video initialization error"),
+                self.tr("Target video device is empty."),
+                QMessageBox.StandardButton.Ok,
+                QMessageBox.StandardButton.NoButton,
+            )
+            return False
+
+        if (
+            self.video_capture_thread is not None
+            or self.video_session is not None
+        ):
+            self.disconnect_video_device()
+
+        self.threads.quit("VIDEO_CAPTURE_THREAD")
+        thread = self.threads.create("VIDEO_CAPTURE_THREAD")
+        self.video_capture_thread = thread
+
+        width = int(self.config.video["resolution_x"])
+        height = int(self.config.video["resolution_y"])
+
+        self.video_capture_worker = DshowRgb24CaptureWorker(
+            device_name,
+            width,
+            height,
+            None,
+        )
+        self.video_capture_worker.moveToThread(thread)
+        thread.started.connect(self.video_capture_worker.run)
+        self.video_capture_worker.stream_started.connect(
+            self.video_capture_stream_started
+        )
+        self.video_capture_worker.frame_ready.connect(self.video_capture_frame)
+        self.video_capture_worker.error_occurred.connect(
+            self.video_capture_error
+        )
+        self.video_capture_worker.finished.connect(self.video_capture_finished)
+        self.set_active_video_widget(self.video_frame_widget)
+        self.apply_video_display_config()
+        thread.start()
+        return True
+
+    def init_qt_multimedia_video_device(self) -> bool:
+        try:
+            if (
+                self.video_capture_thread is not None
+                or self.video_session is not None
+            ):
+                self.disconnect_video_device()
+
+            device_name = str(self.config.video.get("device", ""))
+            if self.is_null_video_device(device_name):
+                return True
+
+            self.video_session = VideoSession(self)
+            self.video_session.init_video_device_with_config(self.config.video)
+            self.video_session.init_capture_session_with_config(
+                self.config.video_record,
+                self.video_qt_widget,
+            )
+            self.video_session.camera.errorOccurred.connect(
+                self.video_device_error_occurred
+            )
+            self.set_active_video_widget(self.video_qt_widget)
+            self.apply_video_display_config()
+            self.video_session.camera.start()
+            camera_format = self.video_session.camera.cameraFormat()
+            width = camera_format.resolution().width()
+            height = camera_format.resolution().height()
+            fps = float(camera_format.maxFrameRate())
+            if width <= 0:
+                width = int(self.config.video["resolution_x"])
+            if height <= 0:
+                height = int(self.config.video["resolution_y"])
+            if fps <= 0:
+                fps = 60.0
+            self.video_capture_stream_started(width, height, fps)
+            return True
+        except Exception as err:
+            self.video_session = None
+            QMessageBox.critical(
+                self,
+                self.tr("Video initialization error"),
+                str(err),
+                QMessageBox.StandardButton.Ok,
+                QMessageBox.StandardButton.NoButton,
+            )
+            return False
 
     # 启用视频设备
     def connect_video_device(self) -> None:
         if not self.init_video_device():
             return
+        return
+
+    # 断开视频设备
+    def disconnect_video_device(self) -> None:
+        if self.video_capture_worker is not None:
+            try:
+                self.video_capture_worker.request_stop()
+            except Exception:
+                pass
+        if self.video_capture_thread is not None:
+            self.video_capture_thread.wait(2000)
+        if self.video_session is not None:
+            try:
+                if self.video_session.camera is not None:
+                    self.video_session.camera.stop()
+            except Exception:
+                pass
+            self.video_session = None
+        self.video_capture_worker = None
+        self.video_capture_thread = None
+        self.video_fps = 0.0
+        self.status.set_bool("camera", False)
+        self.set_video_widget_enable(False)
+        self.setWindowTitle(self.WINDOW_TITLE)
+
+    def video_capture_stream_started(self, width: int, height: int, fps: float):
+        self.video_fps = fps
+        self.status.set_bool("camera", True)
         if not self.status.is_enabled("fullscreen"):
             self.resize_window_with_video_resolution()
-        fps = self.video_session.camera.cameraFormat().maxFrameRate()
         self.set_video_widget_enable(True)
         self.setWindowTitle(
             f"{self.WINDOW_TITLE}"
             + " - "
-            + f"{self.config.video["resolution_x"]}x{self.config.video["resolution_y"]}"
+            + f"{width}x{height}"
             + " @ "
             + f"{fps:.1f}"
         )
         self.update_mouse_report_frequency(int(fps))
 
-    # 断开视频设备
-    def disconnect_video_device(self) -> None:
-        if self.status.is_enabled("camera"):
-            self.video_session.camera.stop()
-            self.video_session.camera.setActive(False)
-            self.status.set_bool("camera", False)
-        self.set_video_widget_enable(False)
-        self.setWindowTitle(self.WINDOW_TITLE)
+    def video_capture_frame(self, frame: QImage):
+        if self.video_frame_widget is None:
+            return
+        self.video_frame_widget.set_frame(frame)
+
+    def video_capture_error(self, message: str):
+        self.disconnect_video_device()
+        QMessageBox.critical(
+            self,
+            self.tr("Video initialization error"),
+            message,
+            QMessageBox.StandardButton.Ok,
+            QMessageBox.StandardButton.NoButton,
+        )
+
+    def video_capture_finished(self):
+        self.threads.quit("VIDEO_CAPTURE_THREAD")
 
     ######################################################################
     # Hook
@@ -2265,13 +2686,11 @@ class AppMainWindow(MainWindow):
         connection_config: dict[str, typing.Any] = copy.copy(
             self.config.connection
         )
-        ui_config: dict[str, typing.Any] = copy.copy(self.config.ui)
 
         # 传入配置文件的配置
         self.settings_dialog.set_video_config(video_config)
         self.settings_dialog.set_controller_config(controller_config)
         self.settings_dialog.set_connection_config(connection_config)
-        self.settings_dialog.set_ui_config(ui_config)
 
         # 根据配置文件选择合适的选项
         self.settings_dialog.refresh_with_config()
@@ -2286,7 +2705,6 @@ class AppMainWindow(MainWindow):
                 video_config = self.settings_dialog.get_video_config()
                 controller_config = self.settings_dialog.get_controller_config()
                 connection_config = self.settings_dialog.get_connection_config()
-                ui_config = self.settings_dialog.get_ui_config()
                 # 检查选项是否有效
                 if video_config["device"] == "":
                     raise ValueError("Invalid device")
@@ -2294,9 +2712,9 @@ class AppMainWindow(MainWindow):
                 self.config.video.update(video_config)
                 self.config.controller.update(controller_config)
                 self.config.connection.update(connection_config)
-                self.config.ui.update(ui_config)
                 # 保存配置
                 self.save_config()
+                self.apply_video_display_config()
             except ValueError:
                 QMessageBox.critical(
                     self,
@@ -2307,9 +2725,6 @@ class AppMainWindow(MainWindow):
                 )
             # 尝试按照新配置启动
             # self.video_device_reset()
-            # 刷新界面语言
-            self.refresh_translate()
-            pass
         pass
 
     ######################################################################
@@ -2532,6 +2947,8 @@ class AppMainWindow(MainWindow):
 
         # 向控制器发送命令
         self.send_keyboard_buffer()
+        # 从缓冲区中清理已松开的按键
+        self.keyboard_key_buffer.clear_released()
 
     # 键盘按下事件
     def handle_key_press_with_event(self, event: QKeyEvent) -> bool:
@@ -2567,19 +2984,19 @@ class AppMainWindow(MainWindow):
             QEvent.Type.WindowDeactivate,
         ]
         if event.type() in window_activate_event:
-            is_active_window: bool = self.isActiveWindow()
-            if not is_active_window and self.status.is_enabled("relative_mode"):
-                # 如果窗口失焦自动释放鼠标捕捉
-                self.mouse_capture_release_triggered()
-            if not is_active_window and self.status.is_enabled("controller"):
+            if not self.isActiveWindow() and self.status.is_enabled(
+                "controller"
+            ):
                 # 窗口失去焦点时释放键盘和鼠标
                 # 防止卡键
                 self.reload_controller("all")
-            pass
+                pass
         logger.debug(f"window change event: {event}")
 
     # 关闭事件
     def handle_close_event(self) -> None:
+        self.unregister_windows_session_notification()
+        self.disconnect_video_device()
         self.disconnect_controller()
         self.timer.quit_all()
         self.threads.quit_all()
@@ -2623,10 +3040,52 @@ class AppMainWindow(MainWindow):
         super().changeEvent(event)
         self.handle_change_event(event)
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.register_windows_session_notification()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        self.unregister_windows_session_notification()
+
+    def nativeEvent(self, eventType, message):
+        handled, result = super().nativeEvent(eventType, message)
+        if platform.system() != "Windows":
+            return handled, result
+        if not self._session_notification_registered:
+            return handled, result
+        et = eventType.data() if hasattr(eventType, "data") else eventType
+        if et not in (
+            b"windows_generic_MSG",
+            b"windows_dispatcher_MSG",
+            "windows_generic_MSG",
+            "windows_dispatcher_MSG",
+        ):
+            return handled, result
+        msg = ctypes.cast(int(message), ctypes.POINTER(WindowsMsg)).contents
+        if int(msg.message) != WM_WTSSESSION_CHANGE:
+            return handled, result
+        wparam = msg.wParam
+        lparam = msg.lParam
+        if hasattr(wparam, "value"):
+            wparam = wparam.value
+        if hasattr(lparam, "value"):
+            lparam = lparam.value
+        wparam = int(wparam) if wparam is not None else 0
+        lparam = int(lparam) if lparam is not None else 0
+        self.on_windows_session_change(wparam, lparam)
+        return handled, result
+
     # 关闭事件
     def closeEvent(self, event: QCloseEvent) -> None:
-        super().closeEvent(event)
-        self.handle_close_event()
+        if self._is_quitting:
+            self.handle_close_event()
+            if self.tray_icon is not None:
+                self.tray_icon.hide()
+            event.accept()
+            return
+        event.ignore()
+        self.hide_to_tray()
 
 
 def clear_splash():
@@ -2696,19 +3155,25 @@ def main():
     command_line_parser()
     argv = sys.argv
     app = QApplication(argv)
-
-    # 创建翻译器
-    app_translator = QTranslator(app)
-    qt_base_translator = QTranslator(app)
-    # 覆盖窗口类默认的翻译器
-    AppMainWindow.QT_BASE_TRANSLATOR = qt_base_translator
-    AppMainWindow.WINDOW_TRANSLATOR = app_translator
-    # 安装翻译器
-    QCoreApplication.installTranslator(AppMainWindow.QT_BASE_TRANSLATOR)
-    QCoreApplication.installTranslator(AppMainWindow.WINDOW_TRANSLATOR)
-
+    app.setQuitOnLastWindowClosed(False)
+    # locale = QLocale().system().name().lower()
+    translate_files: list[str] = []
+    translate_directory_path = project_source_directory_path("translate")
+    translate_directory_files: list[str] = os.listdir(translate_directory_path)
+    for file_name in translate_directory_files:
+        file_path = os.path.join(translate_directory_path, file_name)
+        file_ext = os.path.splitext(file_name)[-1]
+        if file_ext == ".qm":
+            translate_files.append(file_path)
+    for file_path in translate_files:
+        translator = QTranslator(app)
+        if translator.load(file_path):
+            app.installTranslator(translator)
     my_window = AppMainWindow()
-    my_window.show()
+    if platform.system() == "Windows":
+        my_window.hide()
+    else:
+        my_window.show()
     # QTimer.singleShot(100, my_window.shortcut_status)
     clear_splash()
     return app.exec()

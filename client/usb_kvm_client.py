@@ -1,6 +1,7 @@
 import datetime
 import os
 import sys
+import tempfile
 import traceback
 
 
@@ -11,6 +12,14 @@ def write_message(path: str, message: str):
 
 if __name__ == "__main__":
     try:
+        gen_dir = os.environ.get("COMTYPES_GEN_DIR", "").strip()
+        if not gen_dir:
+            gen_dir = os.path.join(
+                tempfile.gettempdir(), "usb_kvm_client_comtypes_gen"
+            )
+            os.makedirs(gen_dir, exist_ok=True)
+            os.environ["COMTYPES_GEN_DIR"] = gen_dir
+
         from main import main
 
         return_code = main()

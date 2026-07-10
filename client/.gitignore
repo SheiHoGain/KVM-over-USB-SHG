@@ -1,0 +1,8 @@
+.venv/
+.dbg/
+__pycache__/
+**/__pycache__/
+build/
+release/
+releases/
+*.py[cod]

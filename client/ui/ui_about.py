@@ -1,6 +1,6 @@
 import codecs
+import os
 import sys
-import platform
 
 from PySide6.QtWidgets import QDialog
 
@@ -45,19 +45,12 @@ class AboutDialog(QDialog, about_ui.Ui_AboutDialog):
         return encoding, encoding_length
 
     def load_dependencies_info(self):
-        sys_name = platform.system().lower()
-        if sys_name == "windows":
-            data_path = project_source_directory_path(
-                "data", "requirements_for_windows.txt"
+        data_path = project_source_directory_path("data", "requirements.bin")
+        if not os.path.exists(data_path):
+            self.text_edit_info.setText(
+                "requirements.bin not found in data directory."
             )
-        elif sys_name == "linux" or sys_name == "darwin":
-            data_path = project_source_directory_path(
-                "data", "requirements_for_posix.txt"
-            )
-        else:
-            data_path = project_source_directory_path(
-                "data", "requirements.txt"
-            )
+            return
         encoding, encoding_length = self.detect_file_bom(data_path)
         # requirements_data = ""
         with open(data_path, "r", encoding=encoding) as fp:

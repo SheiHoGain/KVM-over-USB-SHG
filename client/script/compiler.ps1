@@ -1,8 +1,8 @@
 $root_path = (Resolve-Path ..).path;
 Set-Location $root_path
-# pip freeze > ./data/requirements.txt
-# pip freeze | Out-File ./data/requirements.txt -Encoding utf8
-# poetry export -f requirements.txt --output ./data/requirements.txt --without-hashes
+# pip freeze > ./data/requirements.bin
+# pip freeze | Out-File ./data/requirements.bin -Encoding utf8
+# poetry export -f requirements.txt --output ./data/requirements.bin --without-hashes
 ./script/create_requirements.ps1
 ./ui/ui_resource/regenerate_ui.ps1
 black --safe ./

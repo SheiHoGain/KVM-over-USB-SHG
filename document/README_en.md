@@ -1,5 +1,5 @@
 # KVM over USB
-[![Python version](https://img.shields.io/badge/Python-3.14-blue)](https://www.python.org)
+[![Python version](https://img.shields.io/badge/Python-3.12--3.14-blue)](https://www.python.org)
 [![uv](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json)](https://github.com/astral-sh/uv)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 [![flake8_check](https://badgen.net/github/checks/wevsty/KVM-over-USB/main?label=flake8_check)](https://github.com/wevsty/KVM-over-USB/actions/workflows/code_checks.yml)
@@ -30,7 +30,16 @@ For details, please refer to the documentation: [KVM-Card-Mini Series](https://g
 
 The project's software client is based on a modified and refactored version of the source code from [KVM-Card-Mini-PySide6](https://github.com/ElluIFX/KVM-Card-Mini-PySide6), adapted to use the CH9329 for keyboard and mouse input.
 
+This repository is maintained by `SheiHoGain` as a fork of the upstream project [wevsty/KVM-over-USB](https://github.com/wevsty/KVM-over-USB), while preserving the upstream license and copyright notices.
+
+## Changes
+
+- Added RGB24 video format support.
+- Added a no-display input mode for single keyboard and mouse control without video display input.
+
 ### Client Compilation
+
+Python 3.12-3.14 is recommended. Please use the `requires-python` field in `client/pyproject.toml` as the source of truth.
 
 Assuming you have git, python, and uv installed, you can compile by executing the following commands.
 
@@ -125,6 +134,24 @@ A: Please use the reload or reset function in the software's device menu. If the
 Q: What should I do if the case is incorrect when fast-pasting or using clipboard input?
 
 A: Please sync the keyboard status using the sync indicator function in the menu before trying again.
+
+## License
+
+The source code of this project is distributed under the MIT License. See [LICENSE](../LICENSE) for details.
+
+Because this repository is a maintained fork of an upstream project, the upstream copyright notice is preserved and the fork maintainer's copyright notice is added alongside it.
+
+## Fork And Upstream
+
+The direct upstream of this repository is [wevsty/KVM-over-USB](https://github.com/wevsty/KVM-over-USB).
+
+The software implementation described in this project also references related upstream work such as [ElluIFX/KVM-Card-Mini-PySide6](https://github.com/ElluIFX/KVM-Card-Mini-PySide6).
+
+## Third-Party Notices
+
+Released client binaries may include or depend on third-party components such as PySide6 / Qt, Qt Multimedia plugins, OpenSSL, NumPy, OpenCV, and pywin32.
+
+See [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) for a project-level notice summary. If you redistribute packaged artifacts from `client/releases/`, you should also include this project's `LICENSE` and any license files required by bundled third-party components.
 
 ## Thanks
 

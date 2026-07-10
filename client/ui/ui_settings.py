@@ -1,14 +1,31 @@
 import typing
+import platform
+import os
+import traceback
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtMultimedia import QMediaDevices
-from PySide6.QtWidgets import QComboBox, QDialog
+from PySide6.QtWidgets import QCheckBox, QComboBox, QDialog
 
 from controller.serial_device import SerialDevice
 from ui.ui_resource import settings_ui
 
+try:
+    from pygrabber.dshow_graph import FilterGraph
+except Exception:
+    FilterGraph = None
+
 
 class SettingsDialog(QDialog, settings_ui.Ui_SettingsDialog):
+    NULL_DEVICE_NAME = "NULL"
+    FORMAT_PRIORITY = {
+        "RGB24": 0,
+        "YUYV": 1,
+        "NV12": 2,
+        "MJPEG": 3,
+    }
+
     # 选择 combo box 文本为指定预设值
     @staticmethod
     def select_combo_box_preset_as_current_text(
@@ -21,19 +38,62 @@ class SettingsDialog(QDialog, settings_ui.Ui_SettingsDialog):
             bret = True
         return bret
 
+    @classmethod
+    def normalize_video_format(cls, value: str) -> str:
+        upper_value = value.upper()
+        if upper_value in {"YUY2", "YUYV", "YUYV422"}:
+            return "YUYV"
+        if upper_value in {"MJPG", "MJPEG", "JPEG", "JPG"}:
+            return "MJPEG"
+        if upper_value in {"RGB24", "NV12"}:
+            return upper_value
+        return value
+
     @staticmethod
     def list_video_devices_name() -> list[str]:
         # 获取摄像头信息
         devices = list()
+        devices.append(SettingsDialog.NULL_DEVICE_NAME)
         cameras = QMediaDevices.videoInputs()
         for camera in cameras:
             devices.append(camera.description())
         return devices
 
-    @staticmethod
-    def list_video_device_info(device_name: str) -> tuple[list[str], list[str]]:
+    @classmethod
+    def list_video_device_info(
+        cls, device_name: str
+    ) -> tuple[list[str], list[str]]:
         resolution_list = list()
         format_list = list()
+        if device_name == cls.NULL_DEVICE_NAME:
+            common_resolutions = [
+                (640, 480),
+                (800, 600),
+                (1024, 768),
+                (1280, 720),
+                (1366, 768),
+                (1600, 900),
+                (1920, 1080),
+                (2560, 1440),
+                (3840, 2160),
+            ]
+            for w, h in common_resolutions:
+                s = f"{w}x{h}"
+                if s not in resolution_list:
+                    resolution_list.append(s)
+
+            for screen in QGuiApplication.screens():
+                geo = screen.geometry()
+                s = f"{geo.width()}x{geo.height()}"
+                if s not in resolution_list:
+                    resolution_list.append(s)
+                avail = screen.availableGeometry()
+                s2 = f"{avail.width()}x{avail.height()}"
+                if s2 not in resolution_list:
+                    resolution_list.append(s2)
+
+            return resolution_list, format_list
+
         cameras = QMediaDevices.videoInputs()
         camera_device = None
         for camera in cameras:
@@ -48,9 +108,61 @@ class SettingsDialog(QDialog, settings_ui.Ui_SettingsDialog):
             resolutions_string = f"{width}x{height}"
             if resolutions_string not in resolution_list:
                 resolution_list.append(resolutions_string)
-            format_string = i.pixelFormat().name.split("_")[1]
+            format_string = cls.normalize_video_format(
+                i.pixelFormat().name.split("_")[1]
+            )
             if format_string not in format_list:
                 format_list.append(format_string)
+
+        if platform.system() == "Windows" and FilterGraph is not None:
+            try:
+                graph = FilterGraph()
+                devices = graph.get_input_devices()
+                target_index: int | None = None
+                if device_name in devices:
+                    target_index = devices.index(device_name)
+                else:
+                    lower = device_name.lower()
+                    lower_map = {
+                        d.lower(): idx for idx, d in enumerate(devices)
+                    }
+                    if lower in lower_map:
+                        target_index = lower_map[lower]
+                    else:
+                        for idx, d in enumerate(devices):
+                            if lower in d.lower() or d.lower() in lower:
+                                target_index = idx
+                                break
+
+                if target_index is not None:
+                    graph.add_video_input_device(target_index)
+                    formats = graph.get_input_device().get_formats()
+                    for fmt in formats:
+                        resolutions_string = f"{fmt['width']}x{fmt['height']}"
+                        if resolutions_string not in resolution_list:
+                            resolution_list.append(resolutions_string)
+                        format_string = cls.normalize_video_format(
+                            fmt["media_type_str"]
+                        )
+                        if format_string not in format_list:
+                            format_list.append(format_string)
+                graph.stop()
+                graph.remove_filters()
+            except Exception:
+                try:
+                    base_path = os.path.dirname(os.path.abspath(os.sys.argv[0]))
+                    log_path = os.path.join(base_path, "dshow_enum_error.log")
+                    with open(log_path, "a+", encoding="utf-8") as f:
+                        f.write(traceback.format_exc())
+                        f.write("\n")
+                except Exception:
+                    pass
+        format_list.sort(
+            key=lambda item: (
+                cls.FORMAT_PRIORITY.get(item, 999),
+                item,
+            )
+        )
         return resolution_list, format_list
 
     def __init__(self, parent=None):
@@ -68,8 +180,11 @@ class SettingsDialog(QDialog, settings_ui.Ui_SettingsDialog):
         self.video_config: dict[str, typing.Any] = dict()
         self.controller_config: dict[str, typing.Any] = dict()
         self.connection_config: dict[str, typing.Any] = dict()
-        self.ui_config: dict[str, typing.Any] = dict()
         self.accept_settings: bool = False
+
+        self.check_box_flip_vertical = QCheckBox(self.tab_video)
+        self.check_box_flip_vertical.setText(self.tr("Flip vertical"))
+        self.gridLayout.addWidget(self.check_box_flip_vertical, 3, 1, 1, 1)
 
         # self.adjustSize()
         # 刷新设备信息
@@ -94,7 +209,13 @@ class SettingsDialog(QDialog, settings_ui.Ui_SettingsDialog):
     def get_video_config(self) -> dict[str, typing.Any]:
         vc: dict[str, typing.Any] = dict()
         vc["device"] = self.combo_box_device.currentText()
-        vc["format"] = self.combo_box_format.currentText()
+        if vc["device"] == self.NULL_DEVICE_NAME:
+            vc["format"] = ""
+        else:
+            vc["format"] = self.normalize_video_format(
+                self.combo_box_format.currentText()
+            )
+        vc["flip_vertical"] = self.check_box_flip_vertical.isChecked()
         resolution = self.combo_box_resolution.currentText()
         x, sep, y = resolution.partition("x")
         try:
@@ -137,23 +258,15 @@ class SettingsDialog(QDialog, settings_ui.Ui_SettingsDialog):
     def set_connection_config(self, config: dict[str, typing.Any]) -> None:
         self.connection_config = config
 
-    # 获取连接配置
-    def get_ui_config(self) -> dict[str, typing.Any]:
-        uc: dict[str, typing.Any] = dict()
-        language_text = self.combo_box_language.currentText()
-        uc["language"] = language_text
-        return uc
-
-    # 设置连接配置
-    def set_ui_config(self, config: dict[str, typing.Any]) -> None:
-        self.ui_config = config
-
     # 刷新视频选择界面为运行时配置
     def refresh_video_devices_with_config(self) -> None:
         width = self.video_config["resolution_x"]
         height = self.video_config["resolution_y"]
-        config_format = self.video_config["format"]
+        config_format = self.normalize_video_format(self.video_config["format"])
         config_device = self.video_config["device"]
+        config_flip = self.video_config.get(
+            "flip_vertical", config_format == "RGB24"
+        )
         config_resolution = f"{width}x{height}"
 
         if config_device == "":
@@ -171,9 +284,15 @@ class SettingsDialog(QDialog, settings_ui.Ui_SettingsDialog):
         )
 
         # 设定 format
-        self.select_combo_box_preset_as_current_text(
-            self.combo_box_format, config_format
-        )
+        if (
+            not self.select_combo_box_preset_as_current_text(
+                self.combo_box_format, config_format
+            )
+            and self.combo_box_format.count() > 0
+        ):
+            self.combo_box_format.setCurrentIndex(0)
+
+        self.check_box_flip_vertical.setChecked(bool(config_flip))
 
     # 刷新控制器界面为运行时配置
     def refresh_controller_devices_with_config(self) -> None:
@@ -242,8 +361,13 @@ class SettingsDialog(QDialog, settings_ui.Ui_SettingsDialog):
         for format_string in format_list:
             self.combo_box_format.addItem(format_string)
             default_format = format_string
-        if default_format is not None:
-            self.combo_box_format.setCurrentText(default_format)
+        if device_name == self.NULL_DEVICE_NAME:
+            self.combo_box_format.setEnabled(False)
+            self.combo_box_format.setCurrentText("")
+        else:
+            self.combo_box_format.setEnabled(True)
+            if default_format is not None:
+                self.combo_box_format.setCurrentText(default_format)
 
     # 刷新串行设备
     def refresh_serial_devices(self):
