@@ -42,9 +42,9 @@ ui:
   window_auto_maximized: false
   window_auto_to_center: true
 video:
-  device: 'NULL'
-  flip_vertical: false
-  format: ''
+  device: USB3 PLUS Video
+  flip_vertical: true
+  format: RGB24
   keep_aspect_ratio: true
   resolution_x: 1920
   resolution_y: 1080

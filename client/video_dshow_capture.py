@@ -49,9 +49,18 @@ class DshowRgb24CaptureWorker(QObject):
 
     @staticmethod
     def _format_max_fps(fmt: dict[str, typing.Any]) -> float:
-        return float(
-            max(fmt.get("min_framerate", 0), fmt.get("max_framerate", 0))
-        )
+        a = float(fmt.get("min_framerate", 0) or 0)
+        b = float(fmt.get("max_framerate", 0) or 0)
+        if a <= 0 and b <= 0:
+            return 0.0
+        # 注意：部分 USB HDMI 采集卡驱动（包括 USB3 PLUS Video 这类）
+        # 经常把 min_framerate / max_framerate 两个字段填反，
+        # 会出现 "min_framerate"=60 / "max_framerate"=10 的情况。
+        # 本函数要返回该格式可达到的帧率上限，因此直接取两者中的较大值，
+        # 这样无论驱动字段顺序是否正确都能得到正确的最大帧率：
+        #   驱动填反 (60, 10) -> 60 (正确, 与 OBS 表现一致)
+        #   驱动正常 (30, 60) -> 60 (正确)
+        return float(max(a, b))
 
     @Slot()
     def run(self) -> None:
@@ -60,6 +69,9 @@ class DshowRgb24CaptureWorker(QObject):
             self.finished.emit()
             return
 
+        first_frame_seen: bool = False
+        first_frame_deadline_s: float = 0.0
+        FIRST_FRAME_TIMEOUT_S: float = 4.0
         try:
             comtypes.CoInitialize()
             self._running = True
@@ -93,10 +105,10 @@ class DshowRgb24CaptureWorker(QObject):
             rgb24_formats.sort(key=self._format_max_fps, reverse=True)
             selected = rgb24_formats[0]
             selected_fps = self._format_max_fps(selected)
-            if self.target_fps is not None:
+            if self.target_fps is not None and self.target_fps > 0:
                 selected_fps = min(float(self.target_fps), selected_fps)
             if selected_fps <= 0:
-                selected_fps = 60.0
+                selected_fps = 30.0
 
             video_input.set_format(selected["index"])
 
@@ -110,20 +122,41 @@ class DshowRgb24CaptureWorker(QObject):
             interval_s = 1.0 / float(selected_fps)
             if interval_s < 0.001:
                 interval_s = 0.001
+            wait_timeout_s = max(interval_s * 3.0, 0.25)
             next_ts = time.perf_counter()
+            first_frame_deadline_s = next_ts + FIRST_FRAME_TIMEOUT_S
 
             while not self._stop_event.is_set():
                 next_ts += interval_s
                 self._frame_event.clear()
-                graph.grab_frame()
-                self._frame_event.wait(timeout=interval_s)
+                grab_ok = True
+                try:
+                    graph.grab_frame()
+                except Exception:
+                    if first_frame_seen:
+                        raise
+                    grab_ok = False
+                if grab_ok:
+                    self._frame_event.wait(timeout=wait_timeout_s)
 
                 with self._frame_lock:
                     frame = self._last_frame
                     self._last_frame = None
 
                 if frame is None:
+                    if (
+                        not first_frame_seen
+                        and time.perf_counter() > first_frame_deadline_s
+                    ):
+                        raise RuntimeError(
+                            "No video frame received within "
+                            f"{FIRST_FRAME_TIMEOUT_S:.0f}s after "
+                            "stream started. Check HDMI input signal, "
+                            "resolution compatibility, or try a "
+                            "smaller resolution."
+                        )
                     continue
+                first_frame_seen = True
 
                 frame = np.ascontiguousarray(frame)
                 bytes_per_line = int(frame.shape[1] * frame.shape[2])

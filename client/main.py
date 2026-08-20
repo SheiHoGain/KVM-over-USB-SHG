@@ -102,6 +102,8 @@ from ui.ui_settings import SettingsDialog
 from video_frame_widget import VideoFrameWidget
 
 # 特定系统依赖
+DSHOW_CAPTURE_IMPORT_ERROR: str | None = None
+
 if platform.system() == "Windows":
     try:
         import pythoncom
@@ -113,8 +115,13 @@ if platform.system() == "Windows":
         pyHook = None
     try:
         from video_dshow_capture import DshowRgb24CaptureWorker
-    except Exception:
+    except Exception as _dshow_exc:
         DshowRgb24CaptureWorker = None
+        DSHOW_CAPTURE_IMPORT_ERROR = repr(_dshow_exc)
+        logger.error(
+            "Failed to import DshowRgb24CaptureWorker: {}",
+            DSHOW_CAPTURE_IMPORT_ERROR,
+        )
 else:
     DshowRgb24CaptureWorker = None
 
@@ -656,6 +663,7 @@ class AppMainWindow(MainWindow):
         self.video_capture_thread: QThread | None = None
         self.video_capture_worker: typing.Any = None
         self.video_fps: float = 0.0
+        self._video_init_retry_ctx: dict[str, typing.Any] | None = None
 
         # 初始化键盘以及鼠标数据的缓冲buffer
         self.keyboard_key_buffer: KeyboardKeyBuffer | None = None
@@ -2433,21 +2441,207 @@ class AppMainWindow(MainWindow):
             self.status.set_bool("camera", False)
             self.set_video_widget_enable(False)
             self.setWindowTitle(self.WINDOW_TITLE)
+            self._video_init_retry_ctx = None
             return True
+
+        if self._video_init_retry_ctx is None:
+            self._video_init_retry_ctx = {
+                "tried_rgb24_resolutions": set(),
+                "rgb24_all_failed": False,
+                "last_errors": [],
+                "orig_format": str(self.config.video.get("format", "RGB24")),
+                "orig_resolution": (
+                    int(self.config.video.get("resolution_x", 1280)),
+                    int(self.config.video.get("resolution_y", 720)),
+                ),
+            }
 
         video_format = self.normalize_video_format_name(
             str(self.config.video.get("format", "RGB24"))
         )
+        if video_format == "RGB24" and DshowRgb24CaptureWorker is None:
+            logger.warning(
+                "DirectShow capture unavailable ({}), fallback to Qt Multimedia.",
+                DSHOW_CAPTURE_IMPORT_ERROR or "unknown reason",
+            )
+            detail = (
+                f"\n\nDetail: {DSHOW_CAPTURE_IMPORT_ERROR}"
+                if DSHOW_CAPTURE_IMPORT_ERROR
+                else ""
+            )
+            if self.status.get_bool("tips_system_warning", True):
+                QMessageBox.warning(
+                    self,
+                    self.tr("Video format fallback"),
+                    self.tr(
+                        "DirectShow capture is unavailable, "
+                        "fallback to Qt Multimedia backend."
+                    )
+                    + detail,
+                    QMessageBox.StandardButton.Ok,
+                    QMessageBox.StandardButton.NoButton,
+                )
+            self._video_init_retry_ctx["rgb24_all_failed"] = True
+            video_format = "QT_MULTIMEDIA"
+
         if video_format == "RGB24":
-            return self.init_rgb24_video_device()
-        return self.init_qt_multimedia_video_device()
+            ok = self.init_rgb24_video_device()
+            if not ok:
+                return self._video_init_fallback_or_fail(
+                    "init_rgb24_video_device returned False"
+                )
+            return True
+        ok = self.init_qt_multimedia_video_device()
+        if not ok:
+            self._video_init_fail_final()
+            return False
+        return True
+
+    def _video_init_next_rgb24_resolution(self) -> bool:
+        ctx = self._video_init_retry_ctx or {}
+        tried: set[tuple[int, int]] = ctx.setdefault(
+            "tried_rgb24_resolutions", set()
+        )
+        orig_w, orig_h = ctx.get(
+            "orig_resolution",
+            (
+                int(self.config.video.get("resolution_x", 1280)),
+                int(self.config.video.get("resolution_y", 720)),
+            ),
+        )
+        order: list[tuple[int, int]] = [
+            (orig_w, orig_h),
+            (1920, 1080),
+            (1280, 720),
+            (800, 600),
+            (640, 480),
+            (320, 240),
+        ]
+        seen: set[tuple[int, int]] = set()
+        unique_order: list[tuple[int, int]] = []
+        for pair in order:
+            if pair in seen:
+                continue
+            seen.add(pair)
+            unique_order.append(pair)
+        for w, h in unique_order:
+            if (w, h) in tried:
+                continue
+            if (w, h) != (
+                int(self.config.video.get("resolution_x", 0)),
+                int(self.config.video.get("resolution_y", 0)),
+            ):
+                self.config.video["resolution_x"] = w
+                self.config.video["resolution_y"] = h
+            tried.add((w, h))
+            logger.info(
+                "Try RGB24 resolution fallback: {}x{} (tried={})", w, h, tried
+            )
+            return True
+        ctx["rgb24_all_failed"] = True
+        return False
+
+    def _video_init_fallback_or_fail(self, reason: str) -> bool:
+        ctx = self._video_init_retry_ctx or {}
+        ctx.setdefault("last_errors", []).append(reason)
+        logger.warning("Video init step failed: {}", reason)
+
+        # Case 1: still in RGB24 path, try the next lower resolution
+        if not ctx.get("rgb24_all_failed"):
+            if self._video_init_next_rgb24_resolution():
+                if self.init_rgb24_video_device():
+                    return True
+                # this branch still failing, will continue below to next fallback
+                return self._video_init_fallback_or_fail(
+                    "still failed after resolution retry"
+                )
+            ctx["rgb24_all_failed"] = True
+
+        # Case 2: RGB24 exhausted, switch to Qt Multimedia
+        if self.normalize_video_format_name(
+            str(self.config.video.get("format", ""))
+        ) not in {"YUYV", "MJPEG"}:
+            logger.warning(
+                "Switching video backend from RGB24 to Qt Multimedia."
+            )
+            self.config.video["format"] = "YUYV"
+            ok = self.init_qt_multimedia_video_device()
+            if ok:
+                return True
+            ctx.setdefault("last_errors", []).append(
+                "Qt Multimedia init also failed"
+            )
+
+        # Case 3: everything failed
+        self._video_init_fail_final()
+        return False
+
+    def _translate_video_error(self, message: str) -> str:
+        m = (message or "").strip()
+        if not m:
+            return self.tr("Unknown video error.")
+        if "No video frame received within" in m:
+            return self.tr(
+                "视频启动后 4 秒内没有收到任何画面帧。\n"
+                "请检查：\n"
+                "  1. HKVM / 采集卡的 HDMI 输入端是否接好（被控制的电脑是否开机、是否唤醒、是否输出信号）；\n"
+                "  2. 当前分辨率是否被采集卡支持，可在设置中降低分辨率后重试；\n"
+                "  3. 采集卡是否已被其它程序（相机 App、OBS 等）独占打开，占用会导致本程序读不到帧。"
+            )
+        if "Video device not found" in m:
+            return (
+                self.tr("视频采集设备未找到，请检查设备连接并重试。")
+                + f"\nDetail: {m}"
+            )
+        if "RGB24 format not found" in m:
+            return (
+                self.tr(
+                    "当前分辨率/设备不支持原生 RGB24 格式，已自动尝试其他分辨率或切换视频后端。"
+                )
+                + f"\nDetail: {m}"
+            )
+        if "DirectShow only support windows" in m:
+            return (
+                self.tr("DirectShow/RGB24 视频采集仅支持 Windows。")
+                + f"\nDetail: {m}"
+            )
+        return m
+
+    def _video_init_fail_final(self) -> None:
+        ctx = self._video_init_retry_ctx or {}
+        self.disconnect_video_device()
+        errors = ctx.get("last_errors") or []
+        head = self.tr(
+            "所有视频初始化尝试均失败。\n请检查采集卡接线、分辨率设置、并关闭其他占用该采集卡的程序。"
+        )
+        body = ""
+        if errors:
+            translated = [
+                self._translate_video_error(e) for e in dict.fromkeys(errors)
+            ]
+            body = "\n\n" + "\n\n".join(
+                f"  [{i + 1}] {t}" for i, t in enumerate(translated)
+            )
+        QMessageBox.warning(
+            self,
+            self.tr("Video initialization warning"),
+            f"{head}{body}",
+            QMessageBox.StandardButton.Ok,
+            QMessageBox.StandardButton.NoButton,
+        )
+        self._video_init_retry_ctx = None
 
     def init_rgb24_video_device(self) -> bool:
         if DshowRgb24CaptureWorker is None:
+            detail = (
+                f"\n\n{DSHOW_CAPTURE_IMPORT_ERROR}"
+                if DSHOW_CAPTURE_IMPORT_ERROR
+                else ""
+            )
             QMessageBox.critical(
                 self,
                 self.tr("Video initialization error"),
-                self.tr("DirectShow capture is unavailable."),
+                self.tr("DirectShow capture is unavailable.") + detail,
                 QMessageBox.StandardButton.Ok,
                 QMessageBox.StandardButton.NoButton,
             )
@@ -2598,13 +2792,7 @@ class AppMainWindow(MainWindow):
 
     def video_capture_error(self, message: str):
         self.disconnect_video_device()
-        QMessageBox.critical(
-            self,
-            self.tr("Video initialization error"),
-            message,
-            QMessageBox.StandardButton.Ok,
-            QMessageBox.StandardButton.NoButton,
-        )
+        self._video_init_fallback_or_fail(message)
 
     def video_capture_finished(self):
         self.threads.quit("VIDEO_CAPTURE_THREAD")
